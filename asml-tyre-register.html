@@ -4,6 +4,14 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>ASML Tyre Register</title>
+<meta name="theme-color" content="#1E6B3C">
+<link rel="manifest" href="./manifest.webmanifest">
+<link rel="icon" href="./icon-192.png">
+<link rel="apple-touch-icon" href="./icon-192.png">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js" defer></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -63,7 +71,9 @@ a{color:var(--accent)}
 .tabs button[aria-current="page"]{background:var(--accent-soft);color:var(--accent);font-weight:600}
 .tabs button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .storepill{margin-left:auto;font-size:12.5px;color:var(--ink-3);white-space:nowrap;display:flex;align-items:center;gap:6px}
+#btn-install:not([hidden])+.storepill{margin-left:12px}
 .storepill .dot{width:8px;height:8px;border-radius:50%;background:var(--ink-3)}
+.storepill{cursor:pointer;border-radius:999px;padding:4px 8px} .storepill:hover{background:var(--surface-2)}
 .storepill.shared .dot{background:var(--good)} .storepill.local .dot{background:var(--monitor)} .storepill.offline .dot{background:var(--soon)}
 
 main{max-width:1180px;margin:0 auto;padding:22px 20px 60px}
@@ -199,6 +209,7 @@ dialog::backdrop{background:rgba(10,14,12,.5)}
   .stat{padding-right:14px;margin-right:14px}
   .storepill span.t{display:none}
   .brand .txt{display:none}
+  #btn-install{font-size:12px;padding:4px 8px}
 }
 @media (prefers-reduced-motion:reduce){ *{transition:none!important} }
 </style>
@@ -211,15 +222,18 @@ dialog::backdrop{background:rgba(10,14,12,.5)}
     <button data-view="fleet" aria-current="page">Fleet</button>
     <button data-view="inspect">Inspect</button>
     <button data-view="register">Tyres</button>
+    <button data-view="performance">Performance</button>
     <button data-view="alerts">Alerts</button>
   </nav>
-  <div class="storepill" id="storepill"><span class="dot"></span><span class="t">Connecting…</span></div>
+  <button class="btn sm" id="btn-install" hidden style="margin-left:auto">Install app</button>
+  <div class="storepill" id="storepill" style="margin-left:12px" title="Change the register connection" role="button" tabindex="0"><span class="dot"></span><span class="t">Connecting…</span></div>
 </header>
 
 <main id="main">
   <section class="view on" id="view-fleet"></section>
   <section class="view" id="view-inspect"></section>
   <section class="view" id="view-register"></section>
+  <section class="view" id="view-performance"></section>
   <section class="view" id="view-alerts"></section>
 </main>
 
@@ -444,9 +458,60 @@ const CONFIG = {
 };
 
 /* =========================================================
+   Offline outbox: changes made without a connection wait here and are
+   replayed, in order, the next time the register can be reached.
+   ========================================================= */
+const outbox = {
+  key:'asml_outbox_v1',
+  load(){ try{ return JSON.parse(localStorage.getItem(this.key)||'[]'); }catch(e){ return []; } },
+  save(q){ try{ localStorage.setItem(this.key, JSON.stringify(q)); }catch(e){} },
+  push(op){ const q=this.load(); q.push({...op, t:Date.now()}); this.save(q); setPill(); },
+  size(){ return this.load().length; }
+};
+
+/* =========================================================
+   Fleet tyre IDs: allocated by the Apps Script (PREFIX-YY-NNNN); each device
+   keeps a few reserved so fitting works offline too.
+   ========================================================= */
+const tyreIds = {
+  key:'asml_tyreid_pool', filling:false,
+  load(){ try{ return JSON.parse(localStorage.getItem(this.key)||'[]'); }catch(e){ return []; } },
+  save(p){ try{ localStorage.setItem(this.key, JSON.stringify(p)); }catch(e){} },
+  peek(){ return this.load()[0]||null; },
+  take(id){ const p=this.load(); const i=p.indexOf(id); if(i>=0){ p.splice(i,1); this.save(p); } this.topUp(); },
+  prefix(){ return String((store.settings&&store.settings.tyreIdPrefix)||'ASML').toUpperCase(); },
+  provisional(){ return `${this.prefix()}-${String(new Date().getFullYear()).slice(-2)}-P${Math.random().toString(36).slice(2,6).toUpperCase()}`; },
+  async topUp(){
+    if(this.filling || !store.connected || store.mode==='offline') return;
+    if(this.load().length>=3) return;
+    this.filling=true;
+    try{ const r=await store.api(null,{action:'reserveTyreIds',count:5}); const q=this.load(); (r.ids||[]).forEach(id=>{ if(q.indexOf(id)<0) q.push(id); }); this.save(q);
+         const el=$('#form-fit [name=serial]'); if(el && !el.value){ el.value=this.peek()||''; el.dataset.auto=el.value; const h=$('#fit-id-hint'); if(h) h.textContent='Auto-generated — write this on the tyre. Change it only if the tyre already carries a fleet ID.'; } }
+    catch(e){}
+    finally{ this.filling=false; }
+  },
+  /** ID to prefill in the fit form, and whether it is provisional. */
+  next(){ const id=this.peek(); if(id) return {id, provisional:false}; if(store.apiUrl && store.connected && store.mode!=='offline'){ this.topUp(); return {id:'', provisional:false, pending:true}; } return {id:this.provisional(), provisional:true}; }
+};
+
+/* =========================================================
    Store: Google Sheets via Apps Script, with local fallback
    ========================================================= */
 const store = {
+  flushing:false,
+  async flushOutbox(){
+    const q=outbox.load(); if(!q.length) return;
+    const remaining=[]; let sent=0;
+    for(const op of q){ try{ await this.api(null, op); sent++; }catch(e){ remaining.push(op); } }
+    outbox.save(remaining); setPill();
+    if(sent){ notice(`Synced ${sent} change${sent===1?'':'s'} that ${sent===1?'was':'were'} made offline.`,'info'); await this.refresh(false); }
+  },
+  async send(op, failMsg){
+    if(!this.apiUrl) return;                         // device-only mode: nothing to send
+    if(!this.connected || this.mode==='offline'){ outbox.push(op); return; }
+    try{ await this.api(null, op); }
+    catch(e){ outbox.push(op); this.mode='offline'; this.connected=false; setPill(); notice(failMsg||'No connection — saved on this device; it will sync when the register is reachable again.','warn'); }
+  },
   mode:'connecting', vehicles:new Map(), tyres:new Map(), settings:{}, lastSync:null, noToken:false, readOnly:false,
   apiUrl:'', token:'', connected:false, syncing:false, timer:null, listeners:false,
   async init(){
@@ -458,7 +523,7 @@ const store = {
     await this.refresh(true);
     if(this.timer) clearInterval(this.timer);
     this.timer=setInterval(()=>this.refresh(false), Math.max(15, CONFIG.REFRESH_SECONDS)*1000);
-    if(!this.listeners){ this.listeners=true; document.addEventListener('visibilitychange', ()=>{ if(!document.hidden && this.apiUrl) this.refresh(false); }); }
+    if(!this.listeners){ this.listeners=true; document.addEventListener('visibilitychange', ()=>{ if(!document.hidden && this.apiUrl) this.refresh(false); }); window.addEventListener('online', ()=>{ if(this.apiUrl) this.refresh(false); }); }
   },
   async api(params, body){
     const u = new URL(this.apiUrl);
@@ -475,12 +540,15 @@ const store = {
   async refresh(first){
     try{
       const r = await this.api({action:'all'});
+      if(r.app!=='asml-tyre-register' && !Array.isArray(r.vehicles)) throw new Error(`that address belongs to a different Apps Script${r.app?` (“${r.app}”)`:''} — use the /exec URL of the Tyre Register script`);
       this.vehicles=new Map((r.vehicles||[]).map(v=>[v.id,v]));
       this.tyres=new Map((r.tyres||[]).map(t=>[t.id,t]));
       this.settings=r.settings||{}; this.lastSync=r.lastSync||null; this.noToken=!!r.noToken;
       this.connected=true; this.mode='shared'; this.saveLocal(); setPill(); safeRender();
+      tyreIds.topUp();
+      if(!this.flushing && outbox.size()){ this.flushing=true; try{ await this.flushOutbox(); } finally{ this.flushing=false; } }
     }catch(e){
-      if(first){ this.mode='local'; this.connected=false; notice('Couldn’t reach the register ('+e.message+'). Showing the last copy saved on this device.','warn'); }
+      if(first){ this.mode='local'; this.connected=false; notice('Couldn’t connect to the register: '+e.message+'. Showing the last copy saved on this device.','warn'); }
       else { this.mode='offline'; }
       setPill(); safeRender();
     }
@@ -495,23 +563,23 @@ const store = {
     obj.updatedAt=new Date().toISOString();
     const map = col==='vehicles'?this.vehicles:this.tyres;
     map.set(obj.id, obj); this.saveLocal(); render();
-    if(this.connected){ try{ await this.api(null,{action:'save',col,data:obj}); }catch(e){ notice('That change couldn’t be saved to the register: '+e.message,'danger'); } }
+    await this.send({action:'save',col,data:obj});
   },
   async bulkWrite(col, items){
     const map = col==='vehicles'?this.vehicles:this.tyres;
     const now=new Date().toISOString();
     items.forEach(o=>{ o.updatedAt=now; map.set(o.id,o); });
     this.saveLocal(); render();
-    if(this.connected){ try{ await this.api(null,{action:'bulkSave',col,items}); }catch(e){ notice('The import couldn’t be saved to the register: '+e.message,'danger'); } }
+    await this.send({action:'bulkSave',col,items});
   },
   async remove(col, id){
     const map = col==='vehicles'?this.vehicles:this.tyres;
     map.delete(id); this.saveLocal(); render();
-    if(this.connected){ try{ await this.api(null,{action:'delete',col,id}); }catch(e){ notice('That deletion couldn’t be saved to the register: '+e.message,'danger'); } }
+    await this.send({action:'delete',col,id});
   },
   async saveSettings(sv){
     this.settings={...this.settings,...sv}; this.saveLocal();
-    if(this.connected){ try{ await this.api(null,{action:'settings',data:sv}); }catch(e){} }
+    await this.send({action:'settings',data:sv});
   },
   async syncNow(){
     if(!this.connected){ notice('Connect to the register first, then sync from the tracker.','warn'); return; }
@@ -537,8 +605,9 @@ const store = {
 function setPill(){
   const p=$('#storepill'); const t=p.querySelector('.t');
   p.className='storepill';
-  if(store.mode==='shared'){ p.classList.add('shared'); t.textContent='Connected'; }
-  else if(store.mode==='offline'){ p.classList.add('offline'); t.textContent='Offline — last loaded data'; }
+  const pend=outbox.size(); const sfx=pend?` · ${pend} to sync`:'';
+  if(store.mode==='shared'){ p.classList.add('shared'); t.textContent='Connected'+sfx; }
+  else if(store.mode==='offline'){ p.classList.add('offline'); t.textContent='Offline'+sfx; }
   else if(store.mode==='local'){ p.classList.add('local'); t.textContent=store.apiUrl?'Not connected':'This device only'; }
   else t.textContent='Connecting…';
 }
@@ -565,16 +634,26 @@ function render(){
   if(state.view==='fleet') $('#view-fleet').innerHTML = n + renderFleet();
   if(state.view==='inspect') $('#view-inspect').innerHTML = n + renderInspect();
   if(state.view==='register') $('#view-register').innerHTML = n + renderRegister();
+  if(state.view==='performance') $('#view-performance').innerHTML = n + renderPerformance();
   if(state.view==='alerts') $('#view-alerts').innerHTML = n + renderAlerts();
 }
 
 /* ---------- Fleet ---------- */
+function connectModal(){
+  const u=store.apiUrl, t=store.token;
+  openModal(`<h2>Register connection</h2>
+    <p class="muted">${store.connected?'This device is connected. Paste a different web-app URL or token to switch registers.':'Paste the Apps Script web-app URL (ends in /exec) and the API token. They stay on this device.'}</p>
+    <form id="form-connect-modal" style="margin-top:12px"><div class="formgrid">
+      <div class="field span2"><label>Web app URL</label><input name="url" required placeholder="https://script.google.com/macros/s/…/exec" value="${esc(u)}"></div>
+      <div class="field span2"><label>API token</label><input name="token" placeholder="as set in Script properties" value="${esc(t)}"></div>
+    </div><div class="form-actions">${u?`<button type="button" class="btn left" id="btn-disconnect">Work on this device only</button>`:''}<button type="button" class="btn" data-cancel>Cancel</button><button class="btn primary">Connect</button></div></form>`);
+}
 function connectPanel(){
   if(store.connected){
     return store.noToken ? `<div class="notice warn">The Apps Script has no API_TOKEN set, so anyone with its URL can change this register. Add one under Project Settings → Script properties, then enter it here by reconnecting.</div>` : '';
   }
   if(store.mode==='connecting') return '';
-  if(store.mode==='offline') return `<div class="notice warn">Can’t reach the register right now — showing the last data loaded. Changes are kept on this device and may not reach the shared register.</div>`;
+  if(store.mode==='offline') return `<div class="notice warn">No connection to the register — showing the last data loaded. Anything you record is saved on this device${outbox.size()?` (${outbox.size()} waiting)`:''} and syncs automatically when the connection returns.</div>`;
   const u=store.apiUrl, t=store.token;
   return `<div class="notice info" style="padding:14px 16px">
     <strong>${u?'Couldn’t connect to the register.':'Connect this tool to your register.'}</strong>
@@ -616,7 +695,7 @@ function renderFleet(){
     <div class="actions">
       ${store.connected?`<button class="btn primary" id="btn-sync" ${store.syncing?'disabled':''}>${store.syncing?'Syncing…':'Sync from tracker'}</button>`:''}
       <button class="btn ${store.connected?'':'primary'}" id="btn-add-vehicle">Add vehicle</button>
-      <button class="btn" id="btn-export-fleet">Export CSV</button>
+      <button class="btn" id="btn-export-fleet">Export Excel</button>
     </div>
   </div>
   <div class="stats">
@@ -700,11 +779,13 @@ function renderPanel(v, map){
   const T = TYPES[v.type];
   if(!t){
     if(ro) return `<h2>${esc(pos.label)}</h2><p class="muted">No tyre recorded here.</p>`;
+    const nx=tyreIds.next();
     return `<h2>Fit a tyre — ${esc(pos.label)}</h2>
     <p class="muted">Record the tyre as it is now. Base depth is the tread depth when the tyre was new; the current reading gives the wear percentage straight away.</p>
     <form id="form-fit" data-vid="${esc(v.id)}" data-pos="${esc(pos.id)}" style="margin-top:14px">
       <div class="formgrid">
-        <div class="field"><label>Tyre serial / ID</label><input name="serial" required placeholder="DOT or your own tag"></div>
+        <div class="field"><label>Fleet tyre ID</label><input name="serial" required value="${esc(nx.id)}" data-auto="${esc(nx.provisional?'':nx.id)}" placeholder="${nx.pending?'fetching next ID…':''}" style="font-weight:600;letter-spacing:.03em"><span class="hint" id="fit-id-hint">${nx.provisional?'Provisional ID (no connection) — unique, but outside the sequence. Fine to use.':nx.pending?'Getting the next number from the register…':'Auto-generated — write this on the tyre. Change it only if the tyre already carries a fleet ID.'}</span></div>
+        <div class="field"><label>Manufacturer serial / DOT (optional)</label><input name="dot" placeholder="from the sidewall, for warranty"></div>
         <div class="field"><label>Size</label><input name="size" value="${esc(T.size)}" placeholder="e.g. 295/80 R22.5"></div>
         <div class="field"><label>Brand</label><input name="brand" placeholder="e.g. Bridgestone"></div>
         <div class="field"><label>Model / pattern</label><input name="model"></div>
@@ -726,7 +807,7 @@ function renderPanel(v, map){
   const st=statusOf(t), w=wearOf(t), km=kmRun(t,v), rem=remainingKm(t,v), cpk=costPerKm(t,v);
   const hist = (t.inspections||[]).slice().reverse();
   return `<h2>${esc(pos.label)}</h2>
-    <p class="muted">${esc([t.serial, t.brand, t.model, t.size].filter(Boolean).join(' · '))}</p>
+    <p class="muted">${esc([t.serial, t.brand, t.model, t.size].filter(Boolean).join(' · '))}${t.dot?` · <span title="Manufacturer serial">DOT ${esc(t.dot)}</span>`:''}</p>
     <div class="bigwear" style="color:${STATUS[st].color}">${w==null?'—':fmt(w,0)+'%'}<small>worn · <span class="badge ${st}">${STATUS[st].label}</span></small></div>
     <div class="wearbar"><i style="width:${w==null?0:clamp(w,0,100)}%;background:${STATUS[st].color}"></i></div>
     <dl class="kv">
@@ -760,7 +841,7 @@ function renderRegister(){
     const v=store.vehicles.get(t.vehicleId||t.lastVehicleId);
     const st=statusOf(t), w=wearOf(t), km=kmRun(t,v), rem=remainingKm(t,v);
     return `<tr class="click" data-goto="${esc(t.vehicleId||'')}" data-gopos="${esc(t.position||'')}">
-      <td><strong>${esc(t.serial||'—')}</strong><span class="small">${esc([t.brand,t.model].filter(Boolean).join(' '))}</span></td>
+      <td><strong>${esc(t.serial||'—')}</strong><span class="small">${esc([t.brand,t.model].filter(Boolean).join(' '))}${t.dot?` · DOT ${esc(t.dot)}`:''}</span></td>
       <td>${esc(vname(t.vehicleId||t.lastVehicleId)||'—')}<span class="small">${esc(posLabel(v,t.position||t.lastPosition))}</span></td>
       <td>${esc(t.size||'—')}</td>
       <td class="num">${fmt(t.newDepth,1)} / ${fmt(t.lastDepth,1)}</td>
@@ -773,13 +854,135 @@ function renderRegister(){
   }).join('') || `<tr><td colspan="9"><div class="emptystate">${filt==='all'?'No tyres recorded yet. Go to Inspect, pick a vehicle and tap a wheel position.':'Nothing in this group.'}</div></td></tr>`;
   return `
   <div class="viewhead"><div><h1>Tyres</h1><p class="sub">${all.filter(t=>t.status==='fitted').length} fitted, ${all.filter(t=>t.status!=='fitted').length} removed</p></div>
-    <div class="actions"><button class="btn" id="btn-export-tyres">Export CSV</button></div></div>
+    <div class="actions"><button class="btn" id="btn-export-tyres">Export Excel</button></div></div>
   <div class="chips">${chips}</div>
   <div class="tablewrap"><table>
     <thead><tr><th>Tyre</th><th>Vehicle / position</th><th>Size</th><th class="num">New / now (mm)</th><th class="num">Worn</th><th class="num">km run</th><th class="num">Est. km left</th><th>Status</th><th>Inspected</th></tr></thead>
     <tbody>${rows}</tbody></table></div>`;
 }
 function posLabel(v, id){ if(!v||!id) return id||''; const p=positionsFor(v).find(p=>p.id===id); return p?p.label:id; }
+
+/* ---------- Performance (weighbridge × tracker) ---------- */
+const WB_ALIAS=[[/chamgiwadu|mobile\s*wb|nyaoke/i,'Chamgiwadu'],[/factory|mara\s*coffee/i,'Factory'],[/oloontare/i,'Oloontare'],[/oyani/i,'Oyani'],[/geem/i,'Geem'],[/moita/i,'Moita']];
+const wbName=s=>{ for(const [re,nm] of WB_ALIAS) if(re.test(s||'')) return nm; const t=String(s||'').replace(/\s*(WB|CBC)\s*$/i,'').trim(); return t||'Unknown'; };
+const plateKey=s=>String(s||'').toUpperCase().replace(/[^A-Z0-9]/g,'');
+const isOwnFleet=t=>/ANGATA\s*SUGAR/i.test(t||'');
+function isoDaysAgo(n){ const d=new Date(); d.setDate(d.getDate()-n); return new Date(d.getTime()-d.getTimezoneOffset()*60000).toISOString().slice(0,10); }
+const perf={ from:isoDaysAgo(6), to:todayISO(), group:'vehicle', own:false, rows:null, loading:false, loadedKey:'', error:'', syncing:false };
+
+function vehicleIndex(){
+  const m=new Map();
+  for(const v of store.vehicles.values()){ [v.plate, v.name].forEach(s=>String(s||'').split('/').forEach(part=>{ const k=plateKey(part); if(k && !m.has(k)) m.set(k,v); })); }
+  return m;
+}
+function kmInRange(v, from, to){
+  const h=(v.odoHistory||[]).slice().sort((a,b)=>a.d<b.d?-1:1); if(h.length<2) return null;
+  let start=null,end=null;
+  for(const e of h){ if(e.d<=from) start=e; if(e.d<=to) end=e; }
+  if(!start) start=h.find(e=>e.d>=from && e.d<=to)||null;
+  if(!start||!end||end.d<=start.d) return null;
+  return Math.max(0,(+end.o)-(+start.o));
+}
+async function loadPerf(force){
+  const key=perf.from+'|'+perf.to;
+  if(!force && (perf.loadedKey===key || perf.loading)) return;
+  if(!store.connected){ perf.error='Connect to the register to load weighbridge data.'; perf.rows=null; render(); return; }
+  perf.loading=true; perf.error=''; render();
+  try{ const r=await store.api({action:'weighings', from:perf.from, to:perf.to}); perf.rows=r.rows||[]; perf.loadedKey=key; }
+  catch(e){ perf.error='Couldn’t load weighbridge data: '+e.message; perf.rows=null; }
+  finally{ perf.loading=false; render(); }
+}
+async function wbSyncNow(){
+  if(!store.connected||perf.syncing) return;
+  perf.syncing=true; render();
+  try{ const r=await store.api({action:'wbsync'}); notice(`Weighbridge sync: ${r.calls} lookups, ${r.newCcs} new CCS, ${r.rechecked} re-checked, ${r.closed} newly weighed; cursor at ${r.cursor}${r.pending?`, ${r.pending} still waiting for the next run`:''}.`,'info'); await store.refresh(false); await loadPerf(true); }
+  catch(e){ notice('Weighbridge sync failed: '+e.message,'danger'); }
+  finally{ perf.syncing=false; render(); }
+}
+function perfStats(){
+  const rows=(perf.rows||[]).filter(r=> !perf.own || isOwnFleet(r.tr));
+  const idx=vehicleIndex();
+  const veh=new Map(), tr=new Map(), wb=new Map(), days=new Map();
+  for(const r of rows){
+    const t=(+r.kg||0)/1000, k=r.plateKey||plateKey(r.plate), v=idx.get(k), wn=wbName(r.wb), tn=r.tr||'Unknown';
+    const vk=v?v.id:'raw:'+k;
+    if(!veh.has(vk)) veh.set(vk,{v, plate:r.plate, key:k, trips:0, t:0, days:new Set(), wbs:new Map(), trs:new Map(), last:''});
+    const a=veh.get(vk); a.trips++; a.t+=t; a.days.add(r.on); a.wbs.set(wn,(a.wbs.get(wn)||0)+1); a.trs.set(tn,(a.trs.get(tn)||0)+1); if((r.dt||'')>a.last) a.last=r.dt||'';
+    if(!tr.has(tn)) tr.set(tn,{name:tn,trips:0,t:0,plates:new Set(),days:new Set()}); const b=tr.get(tn); b.trips++; b.t+=t; b.plates.add(k); b.days.add(r.on);
+    if(!wb.has(wn)) wb.set(wn,{name:wn,trips:0,t:0,plates:new Set(),days:new Set()}); const c=wb.get(wn); c.trips++; c.t+=t; c.plates.add(k); c.days.add(r.on);
+    if(!days.has(r.on)) days.set(r.on,{d:r.on,trips:0,t:0}); const dd=days.get(r.on); dd.trips++; dd.t+=t;
+  }
+  const top=m=>[...m.entries()].sort((x,y)=>y[1]-x[1])[0]; 
+  const byVehicle=[...veh.values()].map(a=>{ const km=a.v?kmInRange(a.v,perf.from,perf.to):null; return {...a, activeDays:a.days.size, avg:a.t/a.trips, km, tpk:(km>0)?a.t/km:null, kpt:(km!=null&&a.trips)?km/a.trips:null, topWb:(top(a.wbs)||[''])[0], topTr:(top(a.trs)||[''])[0]}; }).sort((x,y)=>y.t-x.t);
+  const byTransporter=[...tr.values()].map(b=>({...b, vehicles:b.plates.size, activeDays:b.days.size, avg:b.t/b.trips})).sort((x,y)=>y.t-x.t);
+  const byWb=[...wb.values()].map(c=>({...c, vehicles:c.plates.size, activeDays:c.days.size, avg:c.t/c.trips})).sort((x,y)=>y.t-x.t);
+  const daily=[...days.values()].sort((x,y)=>x.d<y.d?-1:1);
+  const totals={trips:rows.length, t:rows.reduce((s,r)=>s+(+r.kg||0)/1000,0), vehicles:veh.size, unmatched:byVehicle.filter(a=>!a.v).length};
+  return {byVehicle,byTransporter,byWb,daily,totals};
+}
+function dailyChart(daily){
+  if(!daily.length) return '';
+  const W=640,H=150,padL=36,padB=22,padT=10; const n=daily.length; const bw=Math.max(2,(W-padL-8)/n-2);
+  const max=Math.max(...daily.map(d=>d.t),1);
+  const bars=daily.map((d,i)=>{ const h=(d.t/max)*(H-padT-padB); const x=padL+i*((W-padL-8)/n); const y=H-padB-h; return `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${bw.toFixed(1)}" height="${h.toFixed(1)}" rx="2" fill="var(--accent)"><title>${esc(d.d)}: ${fmt(d.t,1)} t in ${d.trips} trips</title></rect>`; }).join('');
+  const every=Math.ceil(n/8);
+  const labels=daily.map((d,i)=> i%every===0 ? `<text x="${(padL+i*((W-padL-8)/n)+bw/2).toFixed(1)}" y="${H-6}" text-anchor="middle" class="axlab">${esc(d.d.slice(5))}</text>` : '').join('');
+  const grid=[0,0.5,1].map(f=>{ const y=H-padB-f*(H-padT-padB); return `<line x1="${padL}" y1="${y}" x2="${W-8}" y2="${y}" stroke="var(--line-2)"/><text x="${padL-4}" y="${y+4}" text-anchor="end" class="axlab">${fmt(max*f,0)}</text>`; }).join('');
+  return `<div class="diagram" style="padding:10px 12px 4px;margin-bottom:16px"><div class="vname">Tonnes delivered per day<span>${n} day${n===1?'':'s'}</span></div><svg viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg">${grid}${bars}${labels}</svg></div>`;
+}
+function renderPerformance(){
+  const S=store.settings||{};
+  const wbInfo = S.wbLastSync ? `CCS loaded: ${fmt(S.wbTotal)} · open: ${fmt(S.wbOpen)} · cursor ${esc(S.wbCursor||'')} · weighbridge synced ${ago(S.wbLastSync)}` : 'Weighbridge sync has not run yet.';
+  const chip=(k,l,cur,attr)=>`<button class="chip" ${attr}="${k}" aria-pressed="${cur===k}">${l}</button>`;
+  const head=`<div class="viewhead"><div><h1>Performance</h1><p class="sub">${wbInfo}</p></div>
+    <div class="actions">${store.connected?`<button class="btn" id="btn-wbsync" ${perf.syncing?'disabled':''}>${perf.syncing?'Syncing…':'Sync weighbridge now'}</button>`:''}<button class="btn" id="perf-export" ${perf.rows?'':'disabled'}>Export Excel</button></div></div>
+    <div class="pickers" style="grid-template-columns:150px 150px auto;max-width:none;align-items:end">
+      <div class="field"><label for="perf-from">From</label><input type="date" id="perf-from" value="${perf.from}"></div>
+      <div class="field"><label for="perf-to">To</label><input type="date" id="perf-to" value="${perf.to}"></div>
+      <div class="chips" style="margin:0 0 2px">${chip('7','Last 7 days',null,'data-perf-range')}${chip('30','Last 30 days',null,'data-perf-range')}${chip('month','This month',null,'data-perf-range')}</div>
+    </div>
+    <div class="chips">${chip('vehicle','By vehicle',perf.group,'data-perf-group')}${chip('transporter','By transporter',perf.group,'data-perf-group')}${chip('wb','By weighbridge',perf.group,'data-perf-group')}<span style="width:12px"></span><button class="chip" id="perf-own" aria-pressed="${perf.own}">Own fleet only</button></div>`;
+  if(perf.error) return head+`<div class="notice warn">${esc(perf.error)}</div>`;
+  if(perf.loading) return head+`<div class="emptystate">Loading weighings…</div>`;
+  if(!perf.rows) return head+`<div class="emptystate">Pick a date range to load weighbridge data.</div>`;
+  const st=perfStats();
+  if(!st.totals.trips) return head+`<div class="emptystate">No weighings found between ${esc(perf.from)} and ${esc(perf.to)}${perf.own?' for own fleet':''}. If the weighbridge sync only just started, it may still be catching up — the cursor above shows how far it has got.</div>`;
+  const stats=`<div class="stats">
+    <div class="stat"><div class="n">${fmt(st.totals.trips)}</div><div class="l">Weighings (trips)</div></div>
+    <div class="stat"><div class="n">${fmt(st.totals.t,0)}</div><div class="l">Tonnes delivered</div></div>
+    <div class="stat"><div class="n">${fmt(st.totals.t/st.totals.trips,2)}</div><div class="l">Avg load (t)</div></div>
+    <div class="stat"><div class="n">${fmt(st.totals.vehicles)}</div><div class="l">Vehicles that delivered</div></div>
+    <div class="stat ${st.totals.unmatched?'warn':''}"><div class="n">${fmt(st.totals.unmatched)}</div><div class="l">Plates not in the tracker</div></div>
+  </div>`;
+  let table='';
+  if(perf.group==='vehicle'){
+    table=`<div class="tablewrap"><table><thead><tr><th>Vehicle</th><th>Type</th><th>Transporter</th><th class="num">Trips</th><th class="num">Tonnes</th><th class="num">Avg load</th><th class="num">Active days</th><th class="num">Trips/day</th><th class="num">km (tracker)</th><th class="num">t / km</th><th class="num">km / trip</th><th>Main weighbridge</th><th>Last weighed</th></tr></thead><tbody>
+      ${st.byVehicle.map(a=>`<tr ${a.v?`class="click" data-goto="${esc(a.v.id)}"`:''}>
+        <td><strong>${esc(a.v?a.v.name:a.plate)}</strong>${a.v?(a.v.plate&&a.v.plate!==a.v.name?`<span class="small">${esc(a.v.plate)}</span>`:''):`<span class="small">not in tracker</span>`}</td>
+        <td>${a.v?esc(typeLabel(a.v.type)):'—'}</td><td>${esc(a.topTr)}</td>
+        <td class="num">${a.trips}</td><td class="num">${fmt(a.t,1)}</td><td class="num">${fmt(a.avg,2)}</td><td class="num">${a.activeDays}</td><td class="num">${fmt(a.trips/a.activeDays,1)}</td>
+        <td class="num">${a.km==null?'—':fmt(a.km)}</td><td class="num">${a.tpk==null?'—':fmt(a.tpk,2)}</td><td class="num">${a.kpt==null?'—':fmt(a.kpt,1)}</td>
+        <td>${esc(a.topWb)}</td><td>${a.last?esc(a.last.slice(0,16).replace('T',' ')):'—'}</td></tr>`).join('')}
+    </tbody></table></div>
+    <p class="muted" style="margin-top:8px;font-size:13px">km comes from the tracker’s daily odometer history, so it fills in as the fleet sync accumulates days; t/km and km/trip stay blank until there is at least one day of movement inside the range.</p>`;
+  } else if(perf.group==='transporter'){
+    table=`<div class="tablewrap"><table><thead><tr><th>Transporter</th><th class="num">Vehicles</th><th class="num">Trips</th><th class="num">Tonnes</th><th class="num">Avg load</th><th class="num">Active days</th><th class="num">Trips/day</th></tr></thead><tbody>
+      ${st.byTransporter.map(b=>`<tr><td><strong>${esc(b.name)}</strong>${isOwnFleet(b.name)?' <span class="badge good plain">own fleet</span>':''}</td><td class="num">${b.vehicles}</td><td class="num">${b.trips}</td><td class="num">${fmt(b.t,1)}</td><td class="num">${fmt(b.avg,2)}</td><td class="num">${b.activeDays}</td><td class="num">${fmt(b.trips/b.activeDays,1)}</td></tr>`).join('')}
+    </tbody></table></div>`;
+  } else {
+    table=`<div class="tablewrap"><table><thead><tr><th>Weighbridge</th><th class="num">Trips</th><th class="num">Tonnes</th><th class="num">Avg load</th><th class="num">Vehicles</th><th class="num">Active days</th><th class="num">Trips/day</th></tr></thead><tbody>
+      ${st.byWb.map(c=>`<tr><td><strong>${esc(c.name)}</strong></td><td class="num">${c.trips}</td><td class="num">${fmt(c.t,1)}</td><td class="num">${fmt(c.avg,2)}</td><td class="num">${c.vehicles}</td><td class="num">${c.activeDays}</td><td class="num">${fmt(c.trips/c.activeDays,1)}</td></tr>`).join('')}
+    </tbody></table></div>`;
+  }
+  return head+stats+dailyChart(st.daily)+table;
+}
+async function exportPerf(){
+  if(!perf.rows) return; const st=perfStats(); let rows;
+  if(perf.group==='vehicle') rows=[['vehicle','plate','type','transporter','trips','tonnes','avg_load_t','active_days','trips_per_day','km_tracker','t_per_km','km_per_trip','main_weighbridge','last_weighed']].concat(st.byVehicle.map(a=>[a.v?a.v.name:a.plate,a.v?a.v.plate:a.plate,a.v?typeLabel(a.v.type):'',a.topTr,a.trips,a.t.toFixed(2),a.avg.toFixed(2),a.activeDays,(a.trips/a.activeDays).toFixed(2),a.km??'',a.tpk==null?'':a.tpk.toFixed(3),a.kpt==null?'':a.kpt.toFixed(1),a.topWb,a.last]));
+  else if(perf.group==='transporter') rows=[['transporter','vehicles','trips','tonnes','avg_load_t','active_days']].concat(st.byTransporter.map(b=>[b.name,b.vehicles,b.trips,b.t.toFixed(2),b.avg.toFixed(2),b.activeDays]));
+  else rows=[['weighbridge','trips','tonnes','avg_load_t','vehicles','active_days']].concat(st.byWb.map(c=>[c.name,c.trips,c.t.toFixed(2),c.avg.toFixed(2),c.vehicles,c.activeDays]));
+  await save(`fleet_performance_${perf.group}_${perf.from}_${perf.to}.csv`, csv(rows));
+}
 
 /* ---------- Alerts ---------- */
 function renderAlerts(){
@@ -852,7 +1055,8 @@ function inspectionForm(t, v){
 function editTyreForm(t){
   return `<h2>Edit tyre details</h2>
   <form id="form-edit-tyre" data-tid="${esc(t.id)}"><div class="formgrid">
-    <div class="field"><label>Tyre serial / ID</label><input name="serial" required value="${esc(t.serial||'')}"></div>
+    <div class="field"><label>Fleet tyre ID</label><input name="serial" required value="${esc(t.serial||'')}"></div>
+    <div class="field"><label>Manufacturer serial / DOT</label><input name="dot" value="${esc(t.dot||'')}"></div>
     <div class="field"><label>Size</label><input name="size" value="${esc(t.size||'')}"></div>
     <div class="field"><label>Brand</label><input name="brand" value="${esc(t.brand||'')}"></div>
     <div class="field"><label>Model / pattern</label><input name="model" value="${esc(t.model||'')}"></div>
@@ -949,16 +1153,49 @@ async function doImport(){
 
 /* ---------- CSV export ---------- */
 function csv(rows){ return rows.map(r=>r.map(c=>{ const s=String(c??''); return /[",\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s; }).join(',')).join('\r\n'); }
-async function exportTyres(){
-  const rows=[['serial','vehicle','plate','position','brand','model','size','new_depth_mm','min_depth_mm','current_depth_mm','worn_pct','status','fitted_date','fitted_odo_km','vehicle_odo_km','km_run','est_remaining_km','cost_kes','cost_per_km','pressure_psi','condition','last_inspected','notes']];
+function tyreRows(){
+  const rows=[['tyre_id','dot_serial','vehicle','plate','position','brand','model','size','new_depth_mm','min_depth_mm','current_depth_mm','worn_pct','status','fitted_date','fitted_odo_km','vehicle_odo_km','km_run','est_remaining_km','cost_kes','cost_per_km','pressure_psi','condition','last_inspected','notes']];
   for(const t of store.tyres.values()){ const v=store.vehicles.get(t.vehicleId||t.lastVehicleId); const w=wearOf(t);
-    rows.push([t.serial,v?v.name:'',v?v.plate:'',posLabel(v,t.position||t.lastPosition),t.brand,t.model,t.size,t.newDepth,t.minDepth,t.lastDepth,w==null?'':w.toFixed(1),STATUS[statusOf(t)].label,t.fittedDate,t.fittedOdo,v?v.odometer:'',kmRun(t,v)??'',remainingKm(t,v)==null?'':Math.round(remainingKm(t,v)),t.cost,costPerKm(t,v)==null?'':costPerKm(t,v).toFixed(2),t.lastPressure,t.condition,t.lastInspected,t.notes]); }
-  await save(`tyre_register_${todayISO()}.csv`, csv(rows));
+    rows.push([t.serial,t.dot||'',v?v.name:'',v?v.plate:'',posLabel(v,t.position||t.lastPosition),t.brand,t.model,t.size,t.newDepth,t.minDepth,t.lastDepth,w==null?'':w.toFixed(1),STATUS[statusOf(t)].label,t.fittedDate,t.fittedOdo,v?v.odometer:'',kmRun(t,v)??'',remainingKm(t,v)==null?'':Math.round(remainingKm(t,v)),t.cost,costPerKm(t,v)==null?'':costPerKm(t,v).toFixed(2),t.lastPressure,t.condition,t.lastInspected,t.notes]); }
+  return rows;
 }
-async function exportFleet(){
+async function exportTyres(){ await save(`tyre_register_${todayISO()}.csv`, csv(tyreRows())); }
+function fleetRows(){
   const rows=[['vehicle','plate','vin','type','brand','model','odometer_km','odometer_source','last_active','days_since_active','movement','stationary_days','tyres_fitted','positions','worst_tyre','alerts']];
   for(const v of vehiclesSorted()){ const ts=tyresOf(v.id); rows.push([v.name,v.plate,v.vin||'',typeLabel(v.type),v.brand,v.model,v.odometer,v.odoSource||'',(v.lastActive||'').slice(0,10),daysSinceActive(v)??'',v.moveState||'',stationaryDays(v)??'',ts.length,positionsFor(v).length,worstStatus(ts)?STATUS[worstStatus(ts)].label:'',vehicleAlerts(v).map(a=>a.text).join('; ')]); }
-  await save(`fleet_${todayISO()}.csv`, csv(rows));
+  return rows;
+}
+async function exportFleet(){ await save(`fleet_${todayISO()}.csv`, csv(fleetRows())); }
+function inspectionRows(){
+  const rows=[['tyre_serial','vehicle','position','status','date','odometer_km','tread_mm','pressure_psi','condition','notes','inspected_by']];
+  for(const t of store.tyres.values()){ const v=store.vehicles.get(t.vehicleId||t.lastVehicleId); for(const h of (t.inspections||[])) rows.push([t.serial,v?v.name:'',posLabel(v,t.position||t.lastPosition),t.status,h.date,h.odo??'',h.depth??'',h.pressure??'',h.condition||'',h.notes||'',h.by||'']); }
+  return rows;
+}
+function alertRows(){
+  const rows=[['kind','vehicle','plate','type','detail','status']];
+  for(const v of vehiclesSorted()) for(const a of vehicleAlerts(v)) rows.push(['vehicle',v.name,v.plate||'',typeLabel(v.type),a.text,'']);
+  for(const t of store.tyres.values()){ if(t.status!=='fitted') continue; const st=statusOf(t); if(st==='replace'||st==='soon'){ const v=store.vehicles.get(t.vehicleId); rows.push(['tyre',v?v.name:'',v?v.plate||'':'',v?typeLabel(v.type):'',`${posLabel(v,t.position)} · ${t.serial||''} · ${fmt(t.lastDepth,1)} mm, ${fmt(wearOf(t))}% worn`,STATUS[st].label]); } }
+  return rows;
+}
+function perfRows(group, st){
+  if(group==='vehicle') return [['vehicle','plate','type','transporter','trips','tonnes','avg_load_t','active_days','trips_per_day','km_tracker','t_per_km','km_per_trip','main_weighbridge','last_weighed']].concat(st.byVehicle.map(a=>[a.v?a.v.name:a.plate,a.v?a.v.plate||'':a.plate,a.v?typeLabel(a.v.type):'(not in tracker)',a.topTr,a.trips,+a.t.toFixed(2),+a.avg.toFixed(2),a.activeDays,+(a.trips/a.activeDays).toFixed(2),a.km??'',a.tpk==null?'':+a.tpk.toFixed(3),a.kpt==null?'':+a.kpt.toFixed(1),a.topWb,a.last]));
+  if(group==='transporter') return [['transporter','own_fleet','vehicles','trips','tonnes','avg_load_t','active_days']].concat(st.byTransporter.map(b=>[b.name,isOwnFleet(b.name)?'yes':'',b.vehicles,b.trips,+b.t.toFixed(2),+b.avg.toFixed(2),b.activeDays]));
+  return [['weighbridge','trips','tonnes','avg_load_t','vehicles','active_days']].concat(st.byWb.map(c=>[c.name,c.trips,+c.t.toFixed(2),+c.avg.toFixed(2),c.vehicles,c.activeDays]));
+}
+function weighingRows(){
+  const rows=[['ccs','weighed_on','weighed_datetime','plate','transporter','weighbridge','weighbridge_group','net_kg','farmer','plot','permit','issued_at']];
+  for(const r of (perf.rows||[])) rows.push([r.ccs,r.on,r.dt,r.plate,r.tr,r.wb,wbName(r.wb),r.kg,r.farmer,r.plot,r.permit,r.issuedAt]);
+  return rows;
+}
+async function exportExcel(){
+  if(typeof XLSX==='undefined'){ notice('The Excel library hasn’t loaded (offline?) — exporting the fleet as CSV instead.','warn'); return exportFleet(); }
+  const wb=XLSX.utils.book_new();
+  const add=(name,rows)=>{ const ws=XLSX.utils.aoa_to_sheet(rows); ws['!cols']=rows[0].map((_,i)=>({wch:Math.min(42,Math.max(9,...rows.slice(0,300).map(r=>String(r[i]??'').length+2)))})); ws['!freeze']={xSplit:0,ySplit:1}; XLSX.utils.book_append_sheet(wb, ws, name.slice(0,31)); };
+  add('Fleet', fleetRows()); add('Tyres', tyreRows()); add('Inspections', inspectionRows()); add('Alerts', alertRows());
+  if(perf.rows){ const st=perfStats(); add(`Performance by vehicle`, perfRows('vehicle',st)); add('By transporter', perfRows('transporter',st)); add('By weighbridge', perfRows('wb',st)); add('Weighings', weighingRows()); }
+  const meta=[['ASML Tyre Register export'],['Generated',new Date().toISOString()],['Vehicles',store.vehicles.size],['Tyres',store.tyres.size],['Performance range',perf.rows?`${perf.from} to ${perf.to}${perf.own?' (own fleet only)':''}`:'not loaded — open the Performance tab first to include it']];
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(meta), 'About');
+  XLSX.writeFile(wb, `ASML_tyre_register_${todayISO()}.xlsx`);
 }
 async function save(filename, data){
   const blob=new Blob([data],{type:'text/csv;charset=utf-8'});
@@ -969,10 +1206,11 @@ async function save(filename, data){
 /* =========================================================
    Events
    ========================================================= */
-$('#tabs').addEventListener('click', e=>{ const b=e.target.closest('button[data-view]'); if(!b) return; state.view=b.dataset.view; render(); window.scrollTo(0,0); });
+$('#tabs').addEventListener('click', e=>{ const b=e.target.closest('button[data-view]'); if(!b) return; state.view=b.dataset.view; render(); window.scrollTo(0,0); if(state.view==='performance') loadPerf(false); });
 
 document.addEventListener('change', e=>{
   const t=e.target;
+  if(t.id==='perf-from'||t.id==='perf-to'){ const v=t.value; if(/^\d{4}-\d{2}-\d{2}$/.test(v)){ if(t.id==='perf-from') perf.from=v; else perf.to=v; if(perf.from>perf.to){ const x=perf.from; perf.from=perf.to; perf.to=x; } loadPerf(false); } return; }
   if(t.id==='sel-type'){ state.type=t.value; const v=store.vehicles.get(state.vehicleId); if(v && state.type && v.type!==state.type){ state.vehicleId=''; } state.pos=''; render(); }
   if(t.id==='sel-vehicle'){ state.vehicleId=t.value; state.pos=''; const v=store.vehicles.get(t.value); if(v&&v.type) state.type=v.type; render(); }
   if(t.id==='veh-type'){ const ax=$('#veh-axles'); const T=TYPES[t.value]; if(ax&&T) ax.value = T.trailer ? T.trailer.def : 0; }
@@ -993,10 +1231,14 @@ document.addEventListener('click', async e=>{
   if(q('#btn-add-vehicle')) return openModal(vehicleForm());
   if(q('#btn-import')) return openModal(importForm());
   if(q('#btn-do-import')) return doImport();
-  if(q('#btn-export-tyres')) return exportTyres();
-  if(q('#btn-export-fleet')) return exportFleet();
+  if(q('#btn-export-tyres')||q('#btn-export-fleet')||q('#perf-export')) return exportExcel();
   if(q('#btn-sync')) return store.syncNow();
-  if(q('#btn-disconnect')) return store.disconnect();
+  if(q('#btn-wbsync')) return wbSyncNow();
+  if(q('#perf-own')){ perf.own=!perf.own; render(); return; }
+  const pr=q('[data-perf-range]'); if(pr){ const r=pr.dataset.perfRange; if(r==='month'){ perf.from=todayISO().slice(0,8)+'01'; perf.to=todayISO(); } else { perf.from=isoDaysAgo(+r-1); perf.to=todayISO(); } loadPerf(false); return; }
+  const pg=q('[data-perf-group]'); if(pg){ perf.group=pg.dataset.perfGroup; render(); return; }
+  if(q('#btn-disconnect')){ closeModal(); return store.disconnect(); }
+  if(q('#storepill')) return connectModal();
   if(q('#btn-odo')){ const v=store.vehicles.get(state.vehicleId); if(v) openModal(odoForm(v)); return; }
   const ed=q('[data-edit]'); if(ed){ e.stopPropagation(); const v=store.vehicles.get(ed.dataset.edit); if(v) openModal(vehicleForm(v)); return; }
   const edv=q('[data-editv]'); if(edv){ const v=store.vehicles.get(edv.dataset.editv); if(v) openModal(vehicleForm(v)); return; }
@@ -1017,7 +1259,7 @@ function goto(vid,pos){ const v=store.vehicles.get(vid); if(!v) return; state.vi
 document.addEventListener('submit', async e=>{
   const f=e.target; e.preventDefault();
   const d=Object.fromEntries(new FormData(f).entries());
-  if(f.id==='form-connect'){ store.connect((d.url||'').trim(), (d.token||'').trim()); return; }
+  if(f.id==='form-connect'||f.id==='form-connect-modal'){ closeModal(); store.connect((d.url||'').trim(), (d.token||'').trim()); return; }
   if(f.id==='form-vehicle'){
     const v = f.dataset.id ? {...store.vehicles.get(f.dataset.id)} : {id:uid('v_'), source:'manual'};
     v.name=d.name.trim(); v.plate=(d.plate||'').trim(); v.type=d.type; v.brand=(d.brand||'').trim(); v.model=(d.model||'').trim();
@@ -1035,8 +1277,9 @@ document.addEventListener('submit', async e=>{
   if(f.id==='form-fit'){
     const v=store.vehicles.get(f.dataset.vid); if(!v) return;
     const by=(d.by||'').trim(); if(by) localStorage.setItem('asml_inspector',by);
+    const serial=d.serial.trim().toUpperCase(); const auto=(f.serial.dataset.auto||''); if(auto && serial===auto) tyreIds.take(auto);
     const t={ id:uid('t_'), status:'fitted', vehicleId:v.id, position:f.dataset.pos,
-      serial:d.serial.trim(), size:(d.size||'').trim(), brand:(d.brand||'').trim(), model:(d.model||'').trim(),
+      serial, dot:(d.dot||'').trim(), size:(d.size||'').trim(), brand:(d.brand||'').trim(), model:(d.model||'').trim(),
       newDepth:num(d.newDepth), minDepth:num(d.minDepth), lastDepth:num(d.lastDepth), lastPressure:num(d.lastPressure),
       fittedDate:d.fittedDate||todayISO(), fittedOdo:num(d.fittedOdo), cost:num(d.cost), condition:d.condition, notes:(d.notes||'').trim(),
       lastInspected:todayISO(), inspections:[{date:todayISO(), odo:num(v.odometer), depth:num(d.lastDepth), pressure:num(d.lastPressure), condition:d.condition, notes:(d.notes||'').trim(), by}] };
@@ -1054,7 +1297,7 @@ document.addEventListener('submit', async e=>{
   }
   if(f.id==='form-edit-tyre'){
     const t={...store.tyres.get(f.dataset.tid)};
-    Object.assign(t,{serial:d.serial.trim(),size:(d.size||'').trim(),brand:(d.brand||'').trim(),model:(d.model||'').trim(),newDepth:num(d.newDepth),minDepth:num(d.minDepth),fittedDate:d.fittedDate||'',fittedOdo:num(d.fittedOdo),cost:num(d.cost),notes:(d.notes||'').trim()});
+    Object.assign(t,{serial:d.serial.trim().toUpperCase(),dot:(d.dot||'').trim(),size:(d.size||'').trim(),brand:(d.brand||'').trim(),model:(d.model||'').trim(),newDepth:num(d.newDepth),minDepth:num(d.minDepth),fittedDate:d.fittedDate||'',fittedOdo:num(d.fittedOdo),cost:num(d.cost),notes:(d.notes||'').trim()});
     await store.write('tyres', t); closeModal(); return;
   }
   if(f.id==='form-remove'){
@@ -1066,6 +1309,13 @@ document.addEventListener('submit', async e=>{
     await store.write('tyres', t); closeModal(); state.pos=''; render(); return;
   }
 });
+
+/* PWA: offline shell + install prompt */
+if('serviceWorker' in navigator){ window.addEventListener('load', ()=>{ navigator.serviceWorker.register('./sw.js').catch(()=>{}); }); }
+let installPrompt=null;
+window.addEventListener('beforeinstallprompt', e=>{ e.preventDefault(); installPrompt=e; const b=$('#btn-install'); if(b) b.hidden=false; });
+window.addEventListener('appinstalled', ()=>{ installPrompt=null; const b=$('#btn-install'); if(b) b.hidden=true; });
+$('#btn-install').addEventListener('click', async ()=>{ if(!installPrompt) return; installPrompt.prompt(); try{ await installPrompt.userChoice; }catch(e){} installPrompt=null; $('#btn-install').hidden=true; });
 
 /* boot */
 setPill();
